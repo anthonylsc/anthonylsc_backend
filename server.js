@@ -110,13 +110,16 @@ function getSanitizedPartyObject(partyRow) {
 }
 
 // Auto-advance question after timer expires
-async function scheduleQuestionAdvance(partyCode, timePerQuestion) {
+async function scheduleQuestionAdvance(partyCode, timePerQuestion, startTime) {
   // Clear any existing timer for this party
   if (questionTimers.has(partyCode)) {
     clearTimeout(questionTimers.get(partyCode));
   }
 
-  // Set new timer to advance after timePerQuestion milliseconds
+  // Compute delay based on provided startTime (or now) to avoid drift
+  const targetStart = startTime || (Date.now());
+  const delayMs = Math.max(0, (targetStart + (timePerQuestion * 1000)) - Date.now());
+  // Set new timer to advance after computed delay
   const timerId = setTimeout(async () => {
     try {
       const [rows] = await pool.query('SELECT * FROM parties WHERE code = ?', [partyCode]);
@@ -124,6 +127,15 @@ async function scheduleQuestionAdvance(partyCode, timePerQuestion) {
         const party = rows[0];
         const players = JSON.parse(party.players);
         const game = JSON.parse(party.game);
+
+        const prevIndex = game.currentQuestion;
+        // Log timing and answer counts for the previous question to help debug early advances
+        try {
+          const elapsedPrevMs = Date.now() - (game.startTime || Date.now());
+          const expectedMs = timePerQuestion * 1000;
+          const prevCount = Array.isArray(game.playerAnswers) ? game.playerAnswers.filter(a => a.questionIndex === prevIndex).length : 0;
+          console.log(`Advancing question for party ${partyCode}: prevIndex=${prevIndex} elapsedMs=${elapsedPrevMs} expectedMs=${expectedMs} answersForPrev=${prevCount}`);
+        } catch (e) { /* ignore */ }
 
         // Advance to next question
         game.currentQuestion += 1;
@@ -142,8 +154,8 @@ async function scheduleQuestionAdvance(partyCode, timePerQuestion) {
             timePerQuestion: game.settings.timePerQuestion,
             startTime: game.startTime,
           });
-          // Schedule the next advance
-          scheduleQuestionAdvance(partyCode, game.settings.timePerQuestion);
+          // Schedule the next advance using the new startTime set above
+          scheduleQuestionAdvance(partyCode, game.settings.timePerQuestion, game.startTime);
         } else {
           // All questions done, move to validation
           try {
@@ -414,8 +426,8 @@ io.on('connection', (socket) => {
             startTime: game.startTime,
           }); // Emit only the first question and time with startTime for sync
           
-          // Schedule automatic question advance after timer expires
-          scheduleQuestionAdvance(partyCode, game.settings.timePerQuestion);
+          // Schedule automatic question advance after timer expires (use server startTime)
+          scheduleQuestionAdvance(partyCode, game.settings.timePerQuestion, game.startTime);
         }
       }
     } catch (error) {
