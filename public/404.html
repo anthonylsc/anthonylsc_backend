@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>anthony.lsc</title>
+  <script>
+    /**
+     * GitHub Pages SPA Redirect
+     * 
+     * This script enables GitHub Pages to work with client-side routing (React Router)
+     * by capturing 404 errors and redirecting to the app with the original path
+     * 
+     * How it works:
+     * 1. GitHub Pages serves this 404.html for non-existent routes
+     * 2. We capture the requested path
+     * 3. Redirect to / with the path stored in sessionStorage
+     * 4. React Router then handles the navigation
+     */
+
+    // Capture the requested path
+    const path = window.location.pathname
+    const segments = path.split('/').filter(Boolean)
+
+    // Store the path for the app to use after redirect
+    if (segments.length > 0) {
+      sessionStorage.setItem('redirectPath', path)
+    }
+
+    // Redirect to home page (GitHub Pages will serve index.html)
+    // Keep the locale if present in the URL
+    window.location.replace('/')
+  </script>
+</head>
+<body>
+  <!-- Fallback content for users with JS disabled -->
+  <noscript>
+    <p>This page requires JavaScript to be enabled.</p>
+    <p>
+      <a href="/">Go to homepage</a>
+    </p>
+  </noscript>
+
+  <!-- Loading message -->
+  <div style="
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    height: 100vh;
+    background: #0f172a;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    color: #e2e8f0;
+  ">
+    <div style="text-align: center;">
+      <div style="font-size: 48px; margin-bottom: 20px;">⏳</div>
+      <p>Redirection en cours...</p>
+      <p style="font-size: 14px; color: #94a3b8; margin-top: 10px;">
+        Si la page ne se charge pas, <a href="/" style="color: #60a5fa; text-decoration: none;">cliquez ici</a>
+      </p>
+    </div>
+  </div>
+</body>
+</html>
