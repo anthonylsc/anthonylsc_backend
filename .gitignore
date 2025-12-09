@@ -6,13 +6,22 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
-# Environment files
+# Environment files (never commit)
 .env
+.env.local
 
 # OS files
 .DS_Store
 Thumbs.db
 
-# Optional: build folders (si tu en as)
+# Build folders
 dist/
 build/
+
+# These files are auto-synced from anthony.lsc/server/
+# DO NOT EDIT DIRECTLY - edit in anthony.lsc/server/ instead
+# They will be overwritten by sync-backend.js on each deployment
+# server.js
+# database.js
+# questions.js
+# create-tables.js

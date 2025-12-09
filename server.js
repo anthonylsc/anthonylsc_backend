@@ -28,6 +28,14 @@ const app = express();
 const server = http.createServer(app);
 const allowedOrigins = ["http://localhost:5173", "http://localhost:5174", "https://www.anthonylsc.fr", "https://anthonylsc.github.io"];
 
+// Support range requests for media files
+app.use((req, res, next) => {
+  if (req.url.match(/\.(mp3|wav|m4a|ogg|webm)$/i)) {
+    res.setHeader('Accept-Ranges', 'bytes');
+  }
+  next();
+});
+
 const io = new Server(server, {
   cors: {
     origin: (origin, callback) => {
@@ -116,10 +124,9 @@ async function scheduleQuestionAdvance(partyCode, timePerQuestion, startTime) {
     clearTimeout(questionTimers.get(partyCode));
   }
 
-  // Compute delay based on provided startTime (or now) to avoid drift
+  // Set new timer to advance after timePerQuestion milliseconds
   const targetStart = startTime || (Date.now());
   const delayMs = Math.max(0, (targetStart + (timePerQuestion * 1000)) - Date.now());
-  // Set new timer to advance after computed delay
   const timerId = setTimeout(async () => {
     try {
       const [rows] = await pool.query('SELECT * FROM parties WHERE code = ?', [partyCode]);
@@ -127,8 +134,8 @@ async function scheduleQuestionAdvance(partyCode, timePerQuestion, startTime) {
         const party = rows[0];
         const players = JSON.parse(party.players);
         const game = JSON.parse(party.game);
-
         const prevIndex = game.currentQuestion;
+
         // Log timing and answer counts for the previous question to help debug early advances
         try {
           const elapsedPrevMs = Date.now() - (game.startTime || Date.now());
