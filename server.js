@@ -1,6 +1,3 @@
-import dotenv from 'dotenv';
-dotenv.config();
-
 import express from 'express';
 import http from 'http';
 import { Server } from 'socket.io';
@@ -25,7 +22,7 @@ process.on('SIGTERM', () => {
 });
 
 import pool from './database.js';
-import { createPartiesTable } from './create-tables.js';
+import { createPartiesTable } from './create-tables.js'; // Import the function
 
 const app = express();
 const server = http.createServer(app);
@@ -55,6 +52,7 @@ createPartiesTable(); // Call the function to create the table
 // Simple anti-cheat / sanitization helpers
 const recentSubmissions = new Map(); // key -> timestamp
 const questionTimers = new Map(); // partyCode -> current timer id
+const hostGraceTimers = new Map(); // partyCode -> { timerId, timeoutMs }
 
 function sanitizeQuestion(q) {
   if (!q) return q;
@@ -70,6 +68,8 @@ function sanitizeGameForClient(game) {
     // During playing, do not reveal correct answers
     g.questions = g.questions.map(q => sanitizeQuestion(q));
   }
+  // ALWAYS include playerAnswers - they're needed during validation
+  // They contain the players' answers, not the correct answers
   return g;
 }
 
@@ -87,17 +87,24 @@ function getSanitizedPartyObject(partyRow) {
 
   let includeAnswers = false;
   if (party.game && Array.isArray(party.game.questions)) {
+    // Include answers when game is over (validation phase or results phase)
     includeAnswers = party.game.currentQuestion >= party.game.questions.length;
   }
 
   const sanitized = { ...party };
   if (sanitized.game) {
     if (includeAnswers) {
+      // During validation/results, include full game with all answers and correct answers
       sanitized.game = { ...party.game };
     } else {
+      // During playing, sanitize to hide correct answers
       sanitized.game = sanitizeGameForClient(party.game);
     }
   }
+
+  try {
+    console.log(`Emitting party_state for ${party.code} includeAnswers=${includeAnswers} questionsWithAnswer=${(sanitized.game && Array.isArray(sanitized.game.questions) ? sanitized.game.questions.filter(q=>q && q.hasOwnProperty('answer')).length : 0)}`);
+  } catch (e) {}
 
   return sanitized;
 }
@@ -139,6 +146,20 @@ async function scheduleQuestionAdvance(partyCode, timePerQuestion) {
           scheduleQuestionAdvance(partyCode, game.settings.timePerQuestion);
         } else {
           // All questions done, move to validation
+          try {
+            const playerAnswersCount = Array.isArray(game.playerAnswers) ? game.playerAnswers.length : 0;
+            console.log(`All questions finished for party ${partyCode}. playerAnswers count=${playerAnswersCount}. Expected approx=${players.length * game.questions.length}`);
+            // Log a breakdown per question to help debugging
+            if (Array.isArray(game.playerAnswers)) {
+              const perQ = {};
+              for (const a of game.playerAnswers) {
+                perQ[a.questionIndex] = (perQ[a.questionIndex] || 0) + 1;
+              }
+              console.log('playerAnswers per question:', perQ);
+            }
+          } catch (e) {
+            console.warn('Error logging playerAnswers at game end for', partyCode, e);
+          }
           io.to(partyCode).emit('game_over', { validationRequired: true });
           questionTimers.delete(partyCode);
         }
@@ -274,20 +295,58 @@ io.on('connection', (socket) => {
       const [rows] = await pool.query('SELECT * FROM parties WHERE code = ?', [partyCode]);
       if (rows.length > 0) {
         const party = rows[0];
-        const players = JSON.parse(party.players);
-        
-        // Prevent user from joining twice
-        if (players.some(p => p.id === socket.id)) {
-          return;
+        let players = JSON.parse(party.players);
+
+        // If a player with the same name exists (e.g., reconnect), update their socket id
+        const existingByNameIndex = players.findIndex(p => p.name === playerName);
+        if (existingByNameIndex !== -1) {
+          // Update id for reconnected player and migrate any stored answers
+          const oldId = players[existingByNameIndex].id;
+          players[existingByNameIndex].id = socket.id;
+          try {
+            const game = JSON.parse(party.game);
+            if (game && Array.isArray(game.playerAnswers)) {
+              let migrated = false;
+              for (const ans of game.playerAnswers) {
+                if (ans.playerId === oldId) {
+                  ans.playerId = socket.id;
+                  migrated = true;
+                }
+              }
+              if (migrated) {
+                // Persist migrated answers back to DB
+                await pool.query('UPDATE parties SET game = ? WHERE code = ?', [JSON.stringify(game), partyCode]);
+                console.log('Migrated playerAnswers from', oldId, 'to', socket.id, 'for party', partyCode);
+              }
+            }
+          } catch (e) {
+            console.warn('Failed to migrate playerAnswers on reconnect for', playerName, e);
+          }
+        } else {
+          // Prevent user from joining twice by socket id
+          if (players.some(p => p.id === socket.id)) {
+            return;
+          }
+          players.push({ id: socket.id, name: playerName, score: 0 });
         }
 
-        players.push({ id: socket.id, name: playerName, score: 0 });
-        
-        await pool.query('UPDATE parties SET players = ? WHERE code = ?', [JSON.stringify(players), partyCode]);
-        
-        const updatedParty = { ...party, players, game: JSON.parse(party.game) };
+        // If host had been marked disconnected, and a reconnect matches the host name, clear grace timer
+        const game = JSON.parse(party.game);
+        if (game.hostDisconnected && existingByNameIndex === 0) {
+          game.hostDisconnected = false;
+          delete game.hostDisconnectedAt;
+          // Clear any server-side grace timer
+          if (hostGraceTimers.has(partyCode)) {
+            clearTimeout(hostGraceTimers.get(partyCode));
+            hostGraceTimers.delete(partyCode);
+          }
+        }
+
+        await pool.query('UPDATE parties SET players = ?, game = ? WHERE code = ?', [JSON.stringify(players), JSON.stringify(game), partyCode]);
+
+        const updatedParty = { ...party, players, game };
         socket.join(partyCode);
-          emitSanitizedParty(partyCode, updatedParty); // Emit to all in room
+        emitSanitizedParty(partyCode, updatedParty); // Emit to all in room
       } else {
         socket.emit('party_not_found');
       }
@@ -373,9 +432,13 @@ io.on('connection', (socket) => {
         const players = JSON.parse(party.players);
         const game = JSON.parse(party.game);
         
-        // Ensure the questionIndex matches the current question being asked
-        if (questionIndex !== game.currentQuestion) {
-          return; 
+        // Ensure the questionIndex matches the current question being asked.
+        // Accept submissions for the current question or for the immediately previous
+        // question to tolerate small timing/network races when the server advances
+        // the question at the same moment the client submits.
+        if (!(questionIndex === game.currentQuestion || questionIndex === game.currentQuestion - 1)) {
+          console.log(`Rejecting submit_answer: received index=${questionIndex} current=${game.currentQuestion} for party ${partyCode}`);
+          return;
         }
 
         // Initialize playerAnswers if it doesn't exist
@@ -389,44 +452,51 @@ io.on('connection', (socket) => {
           (ans) => ans.playerId === socket.id && ans.questionIndex === questionIndex
         );
 
+        const playerName = players.find(p => p.id === socket.id)?.name || 'Unknown';
+
         if (existingAnswerIndex !== -1) {
             game.playerAnswers[existingAnswerIndex].answer = answer; // Update existing answer
+            game.playerAnswers[existingAnswerIndex].playerName = playerName;
         } else {
             game.playerAnswers.push({
                 playerId: socket.id,
-                playerName: players.find(p => p.id === socket.id)?.name || 'Unknown',
+                playerName,
                 questionIndex,
-                answer,
-                validated: false, // Will be validated by host
-                isCorrect: false, // Will be set by host
+                answer: answer || '', // Ensure answer is stored even if empty
+                validated: false,
+                isCorrect: false,
             });
         }
 
+        console.log(`Player ${playerName} answered question ${questionIndex}: ${JSON.stringify(answer)}`);
+
         // Increment answers received for current question
-        // This count resets for each question
         if (!game.currentQuestionAnswersReceived) {
             game.currentQuestionAnswersReceived = {};
         }
         game.currentQuestionAnswersReceived[questionIndex] = 
-            (game.currentQuestionAnswersReceived[questionIndex] || 0) + 1;
-
+          (game.currentQuestionAnswersReceived[questionIndex] || 0) + 1;
 
         // Update database with recorded answer
         await pool.query('UPDATE parties SET players = ?, game = ? WHERE code = ?', [
-            JSON.stringify(players), // Players not changed in submit_answer
+            JSON.stringify(players),
             JSON.stringify(game),
             partyCode,
         ]);
 
-        const updatedParty = { ...party, players, game };
-          emitSanitizedParty(partyCode, updatedParty);
+        // Log for debugging: how many answers are stored after this submission
+        try {
+          const count = Array.isArray(game.playerAnswers) ? game.playerAnswers.length : 0;
+          console.log(`After submit_answer: stored playerAnswers count=${count} for party ${partyCode}`);
+        } catch (e) {
+          console.warn('Could not log playerAnswers count', e);
+        }
 
-        // Do NOT advance question on all submissions
-        // Question advances only when timer expires (handled server-side via timeout on game_started and next_question)
+        const updatedParty = { ...party, players, game };
+        emitSanitizedParty(partyCode, updatedParty);
       }
     } catch (error) {
       console.error('Error submitting answer:', error);
-      // Handle error
     }
   });
 
@@ -497,19 +567,71 @@ io.on('connection', (socket) => {
 
         if (playerIndex !== -1) {
           const isHost = playerIndex === 0;
-          
+
           if (isHost) {
-            // Host left: close party and kick all
-            console.log('Host disconnected, closing party:', party.code);
-            await deleteParty(party.code);
-            io.to(party.code).emit('party_closed', { reason: 'Host left the game' });
+            // Host left: start grace period instead of immediately closing
+            console.log('Host disconnected, starting grace timer for party:', party.code);
+            const game = JSON.parse(party.game);
+            game.hostDisconnected = true;
+            game.hostDisconnectedAt = Date.now();
+
+            await pool.query('UPDATE parties SET game = ? WHERE code = ?', [JSON.stringify(game), party.code]);
+
+            const updatedParty = { ...party, players, game };
+            emitSanitizedParty(party.code, updatedParty);
+            io.to(party.code).emit('host_disconnected', { message: 'Host disconnected, waiting for reconnection', timeoutMs: 15000, hostDisconnectedAt: game.hostDisconnectedAt });
+
+            // Clear existing timer if any
+            if (hostGraceTimers.has(party.code)) {
+              clearTimeout(hostGraceTimers.get(party.code));
+              hostGraceTimers.delete(party.code);
+            }
+
+            const timerId = setTimeout(async () => {
+              try {
+                const [rowsNow] = await pool.query('SELECT * FROM parties WHERE code = ?', [party.code]);
+                if (rowsNow.length === 0) return;
+                const pNow = rowsNow[0];
+                const playersNow = JSON.parse(pNow.players);
+                const gameNow = JSON.parse(pNow.game);
+
+                if (gameNow.hostDisconnected) {
+                  if (playersNow.length > 1) {
+                    // Promote next player to host (move index 1 to 0)
+                    const newHost = playersNow[1];
+                    playersNow.splice(1, 1);
+                    playersNow.unshift(newHost);
+                    gameNow.hostDisconnected = false;
+                    delete gameNow.hostDisconnectedAt;
+
+                    await pool.query('UPDATE parties SET players = ?, game = ? WHERE code = ?', [JSON.stringify(playersNow), JSON.stringify(gameNow), party.code]);
+
+                    const updated = { ...pNow, players: playersNow, game: gameNow };
+                    io.to(party.code).emit('host_promoted', { newHostId: playersNow[0].id, newHostName: playersNow[0].name });
+                    emitSanitizedParty(party.code, updated);
+                    console.log('Host promotion executed for party', party.code, 'new host', playersNow[0].name);
+                  } else {
+                    // No other players: delete party
+                    await deleteParty(party.code);
+                    io.to(party.code).emit('party_closed', { reason: 'Host left and no players to continue' });
+                    console.log('Party closed due to host leaving with no remaining players:', party.code);
+                  }
+                }
+              } catch (e) {
+                console.error('Error in host grace timeout:', e);
+              } finally {
+                hostGraceTimers.delete(party.code);
+              }
+            }, 15000);
+
+            hostGraceTimers.set(party.code, timerId);
           } else {
             // Non-host left: remove from players and notify
             players.splice(playerIndex, 1);
             const game = JSON.parse(party.game);
             await pool.query('UPDATE parties SET players = ? WHERE id = ?', [JSON.stringify(players), party.id]);
             const updatedParty = { ...party, players, game };
-              emitSanitizedParty(party.code, updatedParty);
+            emitSanitizedParty(party.code, updatedParty);
             console.log('Player removed from party:', party.code);
           }
           break;
@@ -697,6 +819,19 @@ io.on('connection', (socket) => {
       }
     } catch (error) {
       console.error('Error submitting rematch vote:', error);
+    }
+  });
+
+  socket.on('advance_validation', ({ partyCode, questionIndex, playerIndex }) => {
+    try {
+      // Broadcast validation advancement to all players in the room
+      io.to(partyCode).emit('validation_advanced', {
+        questionIndex,
+        playerIndex,
+      });
+      console.log(`Validation advanced: Question ${questionIndex}, Player ${playerIndex} in party ${partyCode}`);
+    } catch (error) {
+      console.error('Error advancing validation:', error);
     }
   });
 });
