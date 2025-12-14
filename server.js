@@ -49,7 +49,8 @@ const allowedOrigins = [
   "http://localhost:5174",
   "http://localhost:3000",
   "https://www.anthonylsc.fr",
-  "https://anthonylsc.fr"
+  "https://anthonylsc.fr",
+  "https://anthonylscbackend-production.up.railway.app"
 ];
 
 app.use(cors({
