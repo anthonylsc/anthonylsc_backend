@@ -42,6 +42,7 @@ import newsletterRoutes from './routes/newsletter.js';
 import cors from 'cors';
 
 const app = express();
+app.set('trust proxy', 1);
 const server = http.createServer(app);
 
 const allowedOrigins = [
