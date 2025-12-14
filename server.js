@@ -22,11 +22,68 @@ process.on('SIGTERM', () => {
 });
 
 import pool from './database.js';
-import { createPartiesTable } from './create-tables.js'; // Import the function
+import createTables from './create-admin-tables.js'; // Admin & Content tables
+import { createPartiesTable } from './create-tables.js'; // Game parties
+
+// Initialize tables
+createTables();
+createPartiesTable();
+import authRoutes from './routes/auth.js';
+import contentRoutes from './routes/content.js';
+import writingsRoutes from './routes/writings.js';
+import musicsRoutes from './routes/musics.js';
+import gamesRoutes from './routes/games.js';
+import rateLimit from 'express-rate-limit'; // Security
+import uploadRoutes from './routes/upload.js';
+import newsletterRoutes from './routes/newsletter.js';
+
+// ... (existing imports)
+
+import cors from 'cors';
 
 const app = express();
 const server = http.createServer(app);
-const allowedOrigins = ["http://localhost:5173", "http://localhost:5174", "https://www.anthonylsc.fr", "https://anthonylsc.github.io"];
+
+const allowedOrigins = [
+  "http://localhost:5173",
+  "http://localhost:5174",
+  "http://localhost:3000",
+  "https://www.anthonylsc.fr",
+  "https://anthonylsc.fr"
+];
+
+app.use(cors({
+  origin: (origin, callback) => {
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.indexOf(origin) === -1) {
+      const msg = 'The CORS policy for this site does not allow access from the specified Origin.';
+      return callback(new Error(msg), false);
+    }
+    return callback(null, true);
+  },
+  credentials: true
+}));
+
+// 1. Rate Limiting (Performance & Security)
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 300, // Limit each IP to 300 requests per windowMs
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+app.use('/api', limiter); // Apply to API routes
+
+app.use(express.json({ limit: '50mb' })); // Increased limit for images
+
+// API Routes
+app.use('/api/auth', authRoutes);
+app.use('/api/content', contentRoutes);
+app.use('/api/writings', writingsRoutes);
+app.use('/api/musics', musicsRoutes);
+app.use('/api/games', gamesRoutes);
+app.use('/api/upload', uploadRoutes);       // New WebP Upload
+app.use('/api/newsletter', newsletterRoutes); // New Newsletter System
 
 // Support range requests for media files
 app.use((req, res, next) => {
@@ -53,11 +110,12 @@ const port = 3000;
 
 // const parties = {};
 
-import { questions } from './questions.js';
 
-createPartiesTable(); // Call the function to create the table
+import { questions as staticQuestions } from './questions.js';
 
-// Simple anti-cheat / sanitization helpers
+// createPartiesTable(); // Already called above
+
+
 const recentSubmissions = new Map(); // key -> timestamp
 const questionTimers = new Map(); // partyCode -> current timer id
 const hostGraceTimers = new Map(); // partyCode -> { timerId, timeoutMs }
@@ -111,8 +169,8 @@ function getSanitizedPartyObject(partyRow) {
   }
 
   try {
-    console.log(`Emitting party_state for ${party.code} includeAnswers=${includeAnswers} questionsWithAnswer=${(sanitized.game && Array.isArray(sanitized.game.questions) ? sanitized.game.questions.filter(q=>q && q.hasOwnProperty('answer')).length : 0)}`);
-  } catch (e) {}
+    console.log(`Emitting party_state for ${party.code} includeAnswers=${includeAnswers} questionsWithAnswer=${(sanitized.game && Array.isArray(sanitized.game.questions) ? sanitized.game.questions.filter(q => q && q.hasOwnProperty('answer')).length : 0)}`);
+  } catch (e) { }
 
   return sanitized;
 }
@@ -237,8 +295,30 @@ async function generateUniquePartyCode() {
 
 // Clean up on server start
 cleanupAllParties();
+// Active visitors tracking
+const activeVisitors = new Map(); // socketId -> { path, timestamp, device/meta }
+
+function broadcastAnalytics() {
+  const visitors = Array.from(activeVisitors.values());
+  io.emit('analytics_update', {
+    count: visitors.length,
+    pages: visitors.map(v => v.path) // Simplified for privacy/size
+  });
+}
+
 io.on('connection', (socket) => {
-  console.log('a user connected');
+  console.log('a user connected:', socket.id);
+
+  // Analytics: Handle page view routing
+  socket.on('page_view', (data) => {
+    // data: { path: string, title: string }
+    activeVisitors.set(socket.id, {
+      id: socket.id,
+      path: data.path,
+      timestamp: Date.now()
+    });
+    broadcastAnalytics();
+  });
 
   socket.on('create_party', async (settings) => {
     const {
@@ -266,7 +346,7 @@ io.on('connection', (socket) => {
         scores: {},
       }
     };
-    
+
     try {
       await pool.query('INSERT INTO parties (code, players, game) VALUES (?, ?, ?)', [
         partyCode,
@@ -282,7 +362,7 @@ io.on('connection', (socket) => {
           players: JSON.parse(rows[0].players),
           game: JSON.parse(rows[0].game),
         }
-          emitSanitizedParty(partyCode, party);
+        emitSanitizedParty(partyCode, party);
       }
     } catch (error) {
       console.error('Error creating party:', error);
@@ -300,7 +380,7 @@ io.on('connection', (socket) => {
           game: JSON.parse(rows[0].game),
         };
         socket.join(partyCode);
-          socket.emit('party_state', getSanitizedPartyObject(party));
+        socket.emit('party_state', getSanitizedPartyObject(party));
       } else {
         socket.emit('party_not_found');
       }
@@ -386,9 +466,39 @@ io.on('connection', (socket) => {
         if (players[0].id === socket.id) { // Only host can start the game
           const { difficulty, categories, numQuestions } = game.settings;
 
+          // Fetch questions from DB first
+          let allQuestions = [];
+          try {
+            const [qRows] = await pool.query('SELECT * FROM questions');
+            if (qRows.length > 0) {
+              allQuestions = qRows.map(q => {
+                // Adapt DB structure to Game structure if needed
+                // The DB 'data' column contains the JSON object of the question
+                let qData = typeof q.data === 'string' ? JSON.parse(q.data) : q.data;
+                // Ensure category and difficulty are at the top level if expected by game logic
+                return {
+                  ...qData,
+                  category: q.category,
+                  difficulty: q.difficulty,
+                  type: q.type,
+                  id: q.id
+                };
+              });
+              console.log(`Loaded ${allQuestions.length} questions from DB`);
+            }
+          } catch (err) {
+            console.warn('Failed to fetch questions from DB, using static fallback:', err.message);
+          }
+
+          // Fallback if DB empty or failed
+          if (allQuestions.length === 0) {
+            allQuestions = staticQuestions;
+            console.log('Using static questions fallback');
+          }
+
           // Smart difficulty-based filtering
-          let filteredQuestions = questions.filter(q => categories.includes(q.category));
-          
+          let filteredQuestions = allQuestions.filter(q => categories.includes(q.category));
+
           if (difficulty === 'easy') {
             // Only easy questions
             filteredQuestions = filteredQuestions.filter(q => q.difficulty === 'easy');
@@ -432,7 +542,7 @@ io.on('connection', (socket) => {
             timePerQuestion: game.settings.timePerQuestion,
             startTime: game.startTime,
           }); // Emit only the first question and time with startTime for sync
-          
+
           // Schedule automatic question advance after timer expires (use server startTime)
           scheduleQuestionAdvance(partyCode, game.settings.timePerQuestion, game.startTime);
         }
@@ -450,7 +560,7 @@ io.on('connection', (socket) => {
         const party = rows[0];
         const players = JSON.parse(party.players);
         const game = JSON.parse(party.game);
-        
+
         // Ensure the questionIndex matches the current question being asked.
         // Accept submissions for the current question or for the immediately previous
         // question to tolerate small timing/network races when the server advances
@@ -474,33 +584,33 @@ io.on('connection', (socket) => {
         const playerName = players.find(p => p.id === socket.id)?.name || 'Unknown';
 
         if (existingAnswerIndex !== -1) {
-            game.playerAnswers[existingAnswerIndex].answer = answer; // Update existing answer
-            game.playerAnswers[existingAnswerIndex].playerName = playerName;
+          game.playerAnswers[existingAnswerIndex].answer = answer; // Update existing answer
+          game.playerAnswers[existingAnswerIndex].playerName = playerName;
         } else {
-            game.playerAnswers.push({
-                playerId: socket.id,
-                playerName,
-                questionIndex,
-                answer: answer || '', // Ensure answer is stored even if empty
-                validated: false,
-                isCorrect: false,
-            });
+          game.playerAnswers.push({
+            playerId: socket.id,
+            playerName,
+            questionIndex,
+            answer: answer || '', // Ensure answer is stored even if empty
+            validated: false,
+            isCorrect: false,
+          });
         }
 
         console.log(`Player ${playerName} answered question ${questionIndex}: ${JSON.stringify(answer)}`);
 
         // Increment answers received for current question
         if (!game.currentQuestionAnswersReceived) {
-            game.currentQuestionAnswersReceived = {};
+          game.currentQuestionAnswersReceived = {};
         }
-        game.currentQuestionAnswersReceived[questionIndex] = 
+        game.currentQuestionAnswersReceived[questionIndex] =
           (game.currentQuestionAnswersReceived[questionIndex] || 0) + 1;
 
         // Update database with recorded answer
         await pool.query('UPDATE parties SET players = ?, game = ? WHERE code = ?', [
-            JSON.stringify(players),
-            JSON.stringify(game),
-            partyCode,
+          JSON.stringify(players),
+          JSON.stringify(game),
+          partyCode,
         ]);
 
         // Log for debugging: how many answers are stored after this submission
@@ -560,7 +670,7 @@ io.on('connection', (socket) => {
           ]);
 
           const updatedParty = { ...party, players, game };
-            emitSanitizedParty(partyCode, updatedParty);
+          emitSanitizedParty(partyCode, updatedParty);
 
           // Check if all answers for all questions have been validated
           const allAnswersValidated = game.playerAnswers.every(ans => ans.validated);
@@ -578,6 +688,12 @@ io.on('connection', (socket) => {
 
   socket.on('disconnect', async () => {
     console.log('user disconnected:', socket.id);
+
+    // Remove from analytics
+    if (activeVisitors.has(socket.id)) {
+      activeVisitors.delete(socket.id);
+      broadcastAnalytics();
+    }
     try {
       const [parties] = await pool.query('SELECT * FROM parties');
       for (const party of parties) {
@@ -672,7 +788,7 @@ io.on('connection', (socket) => {
 
         if (playerIndex !== -1) {
           const isHost = playerIndex === 0;
-          
+
           if (isHost) {
             // Host left: close party
             await deleteParty(partyCode);
