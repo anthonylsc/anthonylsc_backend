@@ -36,6 +36,7 @@ import gamesRoutes from './routes/games.js';
 import rateLimit from 'express-rate-limit'; // Security
 import uploadRoutes from './routes/upload.js';
 import newsletterRoutes from './routes/newsletter.js';
+import statusRoutes from './routes/status.js';
 
 // ... (existing imports)
 
@@ -86,6 +87,7 @@ app.use('/api/musics', musicsRoutes);
 app.use('/api/games', gamesRoutes);
 app.use('/api/upload', uploadRoutes);       // New WebP Upload
 app.use('/api/newsletter', newsletterRoutes); // New Newsletter System
+app.use('/api/status', statusRoutes);         // System Health Check
 
 // Support range requests for media files
 app.use((req, res, next) => {
